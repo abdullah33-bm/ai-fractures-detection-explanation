@@ -1,0 +1,30 @@
+# .gitignore
+
+# Python virtual environment
+venv/
+
+# Python cache and compiled files
+__pycache__/
+*.pyc
+
+# Secrets file
+.env
+
+# Trained model files
+# Ignore all .pt files by default but allow committing a small, specific model file if needed
+*.pt  # Ignores all .pt files
+!model.pt  # Allow committing `model.pt` (small model - 6MB)
+# Or be more specific if you prefer:
+# best.pt
+
+# Add other potential model formats if you use them
+# *.pth
+# *.h5
+# *.onnx
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Operating System files
+.DS_Store
+Thumbs.db
