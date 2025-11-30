@@ -16,6 +16,7 @@ from fpdf import FPDF # Correct import for fpdf2 library
 from datetime import datetime
 # At the top of app.py
 import pyperclip
+import hashlib
 # --- END OF ADDED IMPORTS ---
 
 # --- GOOGLE GEMINI API CONFIGURATION ---
@@ -191,55 +192,55 @@ def load_yolo_model():
         return None
 
 # --- GEMINI EXPLANATION FUNCTION ---
-@st.cache_data(show_spinner=False) # Only one decorator needed
-def get_fracture_explanation(_image_pil, _model_results, detected_fractures, conf_threshold, language="English"):
+@st.cache_data(show_spinner=False)
+def get_fracture_explanation(image_bytes, detection_summary, detected_fractures, conf_threshold, language="English", image_hash: str = None):
+    """Generate an explanation for a given image using image bytes and a textual detection summary.
+
+    This function is safe to cache because it only accepts hashable/serializable inputs (bytes and strings).
+    Pass `image_hash` if you want caching to key on a precomputed image hash.
+    """
     if not detected_fractures:
         return "No fractures were detected by the AI model above the set confidence threshold."
 
-    prompt_parts = [
+    prompt_header = (
         f"You are an AI assistant specialized in analyzing X-ray images for educational purposes. Respond ONLY in {language}. "
         "Analyze this X-ray image for bone fractures. "
         "Describe what you see in the X-ray, highlighting any visible breaks or anomalies. "
         "Based on the AI detection results provided below, explain *why* a fracture might be identified in the specified areas. "
         "Focus on visual characteristics like bone discontinuity, displacement, or abnormal lines. "
         f"Provide a concise, clear explanation in simple terms, strictly in {language}. Do not give medical advice or diagnosis."
-    ]
-    detection_summary = f"\n\nAI Model Detections (confidence threshold > {conf_threshold:.2f}):\n"
-    # Safely access results properties
-    if _model_results and hasattr(_model_results, 'boxes') and hasattr(_model_results, 'names') and _model_results.names:
-        for idx, box in enumerate(_model_results.boxes):
-            conf = float(box.conf[0]) if box.conf is not None and len(box.conf) > 0 else 0.0
-            cls = int(box.cls[0]) if box.cls is not None and len(box.cls) > 0 else -1
-            class_name = _model_results.names.get(cls, "Unknown")
-            detection_summary += f"- Detected '{class_name}' with {conf:.2f} confidence.\n"
-    else:
-         detection_summary += "- No detection details available.\n"
-    prompt_parts.append(detection_summary)
+    )
 
-    img_byte_arr = io.BytesIO()
-    _image_pil.convert("RGB").save(img_byte_arr, format='JPEG')
-    image_bytes = img_byte_arr.getvalue()
-
+    # Ensure detection_summary already contains details about detections and threshold
     gemini_model = genai.GenerativeModel('models/gemini-2.5-pro') # Using 2.5 Pro
 
     try:
         response = gemini_model.generate_content(
-            [prompt_parts[0], {"mime_type": "image/jpeg", "data": image_bytes}, prompt_parts[1]]
+            [prompt_header, {"mime_type": "image/jpeg", "data": image_bytes}, detection_summary]
         )
         if response.parts:
             return response.text
         else:
             block_reason = "Unknown reason"
-            try: # Attempt to get block reason safely
-                 if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
-                      block_reason = response.prompt_feedback.block_reason
+            try:
+                if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                    block_reason = response.prompt_feedback.block_reason
             except Exception:
-                 pass # Ignore errors getting block reason
+                pass
             st.warning(f"Gemini did not generate an explanation. Reason: {block_reason}")
             return "The AI could not provide an explanation for this image, possibly due to safety filters or content restrictions."
     except Exception as e:
-        st.error(f"❌ Error generating explanation from Gemini: {e}")
-        return "An error occurred while communicating with the explanation AI."
+        err_str = str(e)
+        # Detect common leaked/revoked API key message patterns (403 or leaked)
+        if '403' in err_str or 'leaked' in err_str.lower() or 'api key' in err_str.lower():
+            st.error("❌ Gemini API returned 403 — the configured API key was rejected or reported leaked.")
+            st.error("Immediate action: revoke the leaked key in Google Cloud, create a new API key, and update your `.env` `GOOGLE_API_KEY`.")
+            st.info("After rotating the key, restart the app (stop and `streamlit run app.py`). Do not commit API keys to source control.")
+            return ("The AI explanation service is unavailable because the configured API key was rejected. "
+                    "Rotate your API key and set `GOOGLE_API_KEY` in the environment to resume.")
+        else:
+            st.error(f"❌ Error generating explanation from Gemini: {e}")
+            return "An error occurred while communicating with the explanation AI."
 
 # --- IMAGE PROCESSING FUNCTION ---
 def process_image(image, model, conf_threshold):
@@ -320,6 +321,8 @@ def main():
     # --- Corrected: Initialize session state variables ---
     if 'last_explained_image_name' not in st.session_state:
         st.session_state.last_explained_image_name = None
+    if 'last_explained_image_hash' not in st.session_state:
+        st.session_state.last_explained_image_hash = None
     if 'explanation_generated_for_this_image' not in st.session_state:
         st.session_state.explanation_generated_for_this_image = False
     if 'current_explanation' not in st.session_state:
@@ -406,13 +409,22 @@ def main():
 
     # --- Process only if a file is uploaded ---
     if uploaded_file is not None:
-        # Check if the uploaded file name has changed since last explanation
-        file_changed = st.session_state.last_explained_image_name != uploaded_file.name
+        # Compute a content hash for the uploaded file so different images with the same filename are detected
+        try:
+            image_bytes = uploaded_file.getvalue()
+            image_hash = hashlib.sha256(image_bytes).hexdigest()
+        except Exception:
+            image_bytes = None
+            image_hash = None
+
+        # Check if the uploaded file content has changed since last explanation
+        file_changed = st.session_state.last_explained_image_hash != image_hash
         if file_changed:
-            # Reset explanation flag and stored text if filename changed
+            # Reset explanation flag and stored text if file content changed
             st.session_state.explanation_generated_for_this_image = False
             st.session_state.current_explanation = ""
             st.session_state.last_explained_image_name = uploaded_file.name # Track the new filename
+            st.session_state.last_explained_image_hash = image_hash
             st.session_state.last_explained_language = None # Reset language tracker for new file
 
         # Load and display the original image
@@ -465,12 +477,24 @@ def main():
                     if needs_explanation:
                         st.markdown(f"### 📝 AI Explanation ({st.session_state.selected_language})")
                         with st.spinner(f"✨ Asking Gemini for an explanation in {st.session_state.selected_language}..."):
+                            # Build a textual detection summary to pass to the explanation function
+                            detection_summary = f"\n\nAI Model Detections (confidence threshold > {conf_threshold:.2f}):\n"
+                            if results_obj and hasattr(results_obj, 'boxes') and hasattr(results_obj, 'names') and results_obj.names:
+                                for idx, box in enumerate(results_obj.boxes):
+                                    conf = float(box.conf[0]) if box.conf is not None and len(box.conf) > 0 else 0.0
+                                    cls = int(box.cls[0]) if box.cls is not None and len(box.cls) > 0 else -1
+                                    class_name = results_obj.names.get(cls, "Unknown")
+                                    detection_summary += f"- Detected '{class_name}' with {conf:.2f} confidence.\n"
+                            else:
+                                detection_summary += "- No detection details available.\n"
+
                             explanation = get_fracture_explanation(
-                                image, # Pass original PIL image
-                                results_obj,
+                                image_bytes,
+                                detection_summary,
                                 True,
                                 conf_threshold, # Pass correct threshold
-                                language=st.session_state.selected_language
+                                language=st.session_state.selected_language,
+                                image_hash=image_hash
                             )
                             st.session_state.current_explanation = explanation # Store explanation
                             st.session_state.explanation_generated_for_this_image = True # Mark as generated
@@ -563,6 +587,7 @@ def main():
              st.session_state.explanation_generated_for_this_image = False
              st.session_state.current_explanation = ""
              st.session_state.last_explained_language = None
+             st.session_state.last_explained_image_hash = None
 
     # Footer
     st.markdown("<hr style='border: 1px solid rgba(168, 237, 234, 0.2); margin-top: 2rem; margin-bottom: 1rem;'>", unsafe_allow_html=True)
